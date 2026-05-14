@@ -1,8 +1,3 @@
-"""
-Voice Assistant Lite
-Голосовой ассистент на Python + Vosk (офлайн)
-"""
-
 import os
 import sys
 import json
@@ -14,8 +9,6 @@ import time
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 import pyautogui
-import pyttsx3
-import sounddevice as sd
 import numpy as np
 
 # Vosk
@@ -24,6 +17,15 @@ try:
     VOSK_AVAILABLE = True
 except ImportError:
     VOSK_AVAILABLE = False
+
+# Silero TTS
+try:
+    import torch
+    import sounddevice as sd
+    SILERO_AVAILABLE = True
+except ImportError:
+    SILERO_AVAILABLE = False
+    print("⚠ Необходимые библиотеки не установлены. Установите: pip install torch sounddevice")
 
 # ─────────────────────────────────────────────
 #  Константы
@@ -34,45 +36,107 @@ COMMANDS_FILE = "commands.json"
 FORBIDDEN_COMMANDS = ["format c:", "del /f /s /q c:\\", "rm -rf /", "rmdir /s /q c:\\"]
 
 # ─────────────────────────────────────────────
-#  Синтез речи (TTS)
+#  Нейросетевой синтез речи (Silero TTS)
 # ─────────────────────────────────────────────
-class Speaker:
-    """Голосовой вывод через Windows SAPI."""
+class NeuralSpeaker:
+    """Нейросетевой голос на основе Silero TTS (офлайн, легкий)"""
     
     def __init__(self):
         self._lock = threading.Lock()
-        print("[TTS] Инициализация голоса...")
-
+        self._model = None
+        self._sample_rate = 48000
+        self._device = torch.device('cpu')
+        self._load_model()
+    
+    def _load_model(self):
+        """Загрузка модели Silero TTS для русского языка"""
+        if not SILERO_AVAILABLE:
+            print("[TTS] Torch или sounddevice не установлены")
+            return
+        
+        try:
+            print("[TTS] Загрузка нейросетевой модели Silero TTS...")
+            print("[TTS] Это может занять 30-60 секунд при первом запуске...")
+            
+            # Загружаем модель для русского языка
+            self._model, _ = torch.hub.load(
+                repo_or_dir='snakers4/silero-models',
+                model='silero_tts',
+                language='ru',
+                speaker='v3_1_ru'
+            )
+            self._model.to(self._device)
+            
+            print(f"[TTS] Модель загружена! Частота дискретизации: {self._sample_rate} Гц")
+            print("[TTS] Нейросетевой голос готов к работе")
+            
+        except Exception as e:
+            print(f"[TTS] Ошибка загрузки модели: {e}")
+            print("[TTS] Проверьте подключение к интернету (модель скачивается при первом запуске)")
+            self._model = None
+    
     def say(self, text: str):
+        """Синтез речи через нейросеть и воспроизведение"""
         if not text:
+            return
+        
+        if self._model is None:
+            print("[TTS] Модель не загружена, использую fallback")
+            self._fallback_say(text)
             return
         
         def _speak():
             with self._lock:
                 try:
-                    import win32com.client
-                    speaker = win32com.client.Dispatch("SAPI.SpVoice")
+                    # Генерация аудио через нейросеть
+                    audio = self._model.apply_tts(
+                        text=text,
+                        speaker='xenia',  # xenia, aidar, baya, kseniya
+                        sample_rate=self._sample_rate
+                    )
                     
-                    # Ищем русский голос (Irina)
-                    voices = speaker.GetVoices()
-                    for i in range(voices.Count):
-                        voice = voices.Item(i)
-                        desc = voice.GetDescription()
-                        if "Irina" in desc or "Russian" in desc:
-                            speaker.Voice = voice
-                            break
-                    
-                    speaker.Rate = 0
-                    speaker.Volume = 100
-                    speaker.Speak(text, 0)  # 0 = синхронно, чтобы точно проиграть
+                    # Воспроизведение через sounddevice
+                    sd.play(audio.cpu().numpy(), self._sample_rate)
+                    sd.wait()  # Ждём окончания воспроизведения
                     
                 except Exception as e:
-                    print(f"[TTS] Ошибка: {e}")
+                    print(f"[TTS] Ошибка синтеза: {e}")
+                    self._fallback_say(text)
         
         threading.Thread(target=_speak, daemon=False).start()
+    
+    def _fallback_say(self, text: str):
+        """Fallback-метод если Silero не работает"""
+        try:
+            import win32com.client
+            speaker = win32com.client.Dispatch("SAPI.SpVoice")
+            
+            voices = speaker.GetVoices()
+            for i in range(voices.Count):
+                voice = voices.Item(i)
+                desc = voice.GetDescription()
+                if "Irina" in desc or "Russian" in desc:
+                    speaker.Voice = voice
+                    break
+            
+            speaker.Rate = 0
+            speaker.Volume = 100
+            speaker.Speak(text, 1)
+            
+        except Exception as e:
+            print(f"[TTS] Ошибка fallback: {e}")
+            # Последняя попытка - через pyttsx3
+            try:
+                import pyttsx3
+                engine = pyttsx3.init()
+                engine.say(text)
+                engine.runAndWait()
+            except:
+                pass
 
 
-speaker = Speaker()
+# Создаём глобальный экземпляр спикера
+speaker = NeuralSpeaker()
 
 
 # ─────────────────────────────────────────────
@@ -81,45 +145,31 @@ speaker = Speaker()
 class CommandManager:
     """Хранит встроенные и пользовательские команды, выполняет их."""
 
-    # (команда, (тип, значение, фраза_ответа))
     BUILTIN = {
-        # Система
         "открой калькулятор":   ("app",    "calc.exe", "Открываю калькулятор"),
         "открой блокнот":       ("app",    "notepad.exe", "Открываю блокнот"),
         "закрой окно":          ("hotkey", ["alt", "f4"], "Закрываю окно"),
         "выключи компьютер":    ("danger", "shutdown /s /t 0", "Выключаю компьютер"),
         "выключи пк":           ("danger", "shutdown /s /t 0", "Выключаю компьютер"),
         "выключи комп":         ("danger", "shutdown /s /t 0", "Выключаю компьютер"),
-        
-        # Интернет
         "открой почту":         ("url",    "https://mail.ru", "Открываю почту"),
         "что нового":           ("url",    "https://news.yandex.ru", "Открываю новости"),
         "включи ютуб":          ("url",    "https://youtube.com", "Включаю ютуб"),
         "включи саундклауд":    ("url",    "https://soundcloud.com", "Включаю саундклауд"),
-        "включи soundcloud":    ("url",    "https://soundcloud.com", "Включаю саундклауд"),
         "открой ютуб":          ("url",    "https://youtube.com", "Открываю ютуб"),
-        
-        # Игры и программы
         "включи кс":            ("steam",  "730", "Включаю контр страйк"),
         "включи контр страйк":  ("steam",  "730", "Включаю контр страйк"),
-        "включи counter strike":("steam",  "730", "Включаю контр страйк"),
         "включи дискорд":       ("app",    "discord", "Включаю дискорд"),
         "открой дискорд":       ("app",    "discord", "Открываю дискорд"),
-        
-        # Управление ПК
         "заблокировать экран":  ("hotkey", ["win", "l"], "Блокирую экран"),
         "увеличь громкость":    ("volume", "+", "Я увеличил громкость"),
         "уменьши громкость":    ("volume", "-", "Я уменьшил громкость"),
         "громче":               ("volume", "+", "Громкость увеличена"),
         "тише":                 ("volume", "-", "Громкость уменьшена"),
-        
-        # Дата и время
-        "какое сегодня число":  ("datetime", "date", None),  # ответ формируется динамически
+        "какое сегодня число":  ("datetime", "date", None),
         "сколько времени":      ("datetime", "time", None),
         "который час":          ("datetime", "time", None),
         "какая дата":           ("datetime", "date", None),
-        
-        # Разное
         "привет":               ("reply",  None, "Привет! Чем помочь?"),
         "как дела":             ("reply",  None, "Всё отлично! Жду ваших команд."),
         "спасибо":              ("reply",  None, "Пожалуйста!"),
@@ -127,21 +177,15 @@ class CommandManager:
     }
 
     def __init__(self, app_callback):
-        """
-        app_callback(text, success) — вызывается после выполнения команды,
-        чтобы обновить GUI и произнести ответ.
-        """
         self._cb = app_callback
         self._user_commands: dict = {}
         self._load_user_commands()
 
-    # ── Загрузка / сохранение пользовательских команд ──────────────────
     def _load_user_commands(self):
         if os.path.exists(COMMANDS_FILE):
             try:
                 with open(COMMANDS_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                # Убираем служебные ключи
                 self._user_commands = {
                     k: v for k, v in data.items()
                     if not k.startswith("_comment")
@@ -150,8 +194,7 @@ class CommandManager:
                 self._user_commands = {}
 
     def save_user_commands(self):
-        data = {"_comment": "Пользовательские команды. Формат: 'фраза': 'действие'",
-                "_comment2": "Действие: путь к программе, URL (http://...) или cmd:..."}
+        data = {"_comment": "Пользовательские команды. Формат: 'фраза': 'действие'"}
         data.update(self._user_commands)
         with open(COMMANDS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -163,41 +206,31 @@ class CommandManager:
     def get_all_phrases(self) -> list:
         return list(self.BUILTIN.keys()) + list(self._user_commands.keys())
 
-    # ── Основной метод выполнения ───────────────────────────────────────
     def execute(self, text: str, confirmed: bool = False) -> tuple[bool, str]:
-        """
-        Возвращает (success, message).
-        confirmed=True — пользователь уже подтвердил опасное действие.
-        """
         text = text.lower().strip()
 
-        # 1. Встроенные команды
         if text in self.BUILTIN:
             return self._run_builtin(text, self.BUILTIN[text], confirmed)
 
-        # 2. Пользовательские команды
         if text in self._user_commands:
             return self._run_user(text, self._user_commands[text])
 
-        # 3. "выполни команду <что-то>"
         if text.startswith("выполни команду "):
             cmd = text[len("выполни команду "):].strip()
             return self._run_shell(cmd, f"Выполняю: {cmd}")
 
-        # 4. Частичное совпадение (первые слова)
         for phrase in self.get_all_phrases():
             if text.startswith(phrase):
                 return self.execute(phrase, confirmed)
 
         return False, "Я не понял команду. Попробуйте ещё раз."
 
-    # ── Встроенные обработчики ──────────────────────────────────────────
     def _run_builtin(self, phrase: str, spec: tuple, confirmed: bool) -> tuple[bool, str]:
         kind, value, speak_msg = spec
 
         if kind == "danger":
             if not confirmed:
-                return None, phrase   # нужно подтверждение
+                return None, phrase
             return self._run_shell(value, speak_msg)
 
         if kind == "app":
@@ -242,7 +275,6 @@ class CommandManager:
         return False, "Неизвестная команда"
 
     def _run_user(self, phrase: str, action: str) -> tuple[bool, str]:
-        # Проверка запрещённых команд
         for forbidden in FORBIDDEN_COMMANDS:
             if forbidden in action.lower():
                 return False, "Команда запрещена по соображениям безопасности"
@@ -261,7 +293,6 @@ class CommandManager:
                 return False, str(e)
 
     def _run_shell(self, cmd: str, speak_msg: str = None) -> tuple[bool, str]:
-        # Проверка запрещённых команд
         for forbidden in FORBIDDEN_COMMANDS:
             if forbidden in cmd.lower():
                 return False, "Команда запрещена по соображениям безопасности"
@@ -284,7 +315,6 @@ class CommandManager:
         now = datetime.datetime.now()
         if what == "date":
             msg = now.strftime("Сегодня %d %B %Y года")
-            # Русификация месяца
             months = {
                 "January": "января", "February": "февраля", "March": "марта",
                 "April": "апреля", "May": "мая", "June": "июня",
@@ -303,8 +333,8 @@ class CommandManager:
 # ─────────────────────────────────────────────
 class SpeechRecognizer:
     def __init__(self, on_result, on_status):
-        self._on_result = on_result   # callback(text)
-        self._on_status = on_status   # callback(status_str)
+        self._on_result = on_result
+        self._on_status = on_status
         self._q: queue.Queue = queue.Queue()
         self._running = False
         self._thread: threading.Thread | None = None
@@ -375,7 +405,7 @@ class SpeechRecognizer:
 class VoiceAssistantApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Голосовой Помощник")
+        self.title("Голосовой Помощник - Silero TTS Neural Voice")
         self.resizable(False, False)
         self._build_ui()
 
@@ -385,11 +415,9 @@ class VoiceAssistantApp(tk.Tk):
             on_status=self._set_status,
         )
 
-        # Состояние ожидания подтверждения
-        self._pending_dangerous: str | None = None   # фраза опасной команды
+        self._pending_dangerous: str | None = None
         self._waiting_confirm = False
 
-    # ── Построение интерфейса ───────────────────────────────────────────
     def _build_ui(self):
         BG = "#1e1e2e"
         FG = "#cdd6f4"
@@ -400,7 +428,6 @@ class VoiceAssistantApp(tk.Tk):
 
         self.configure(bg=BG)
 
-        # Заголовок
         tk.Label(
             self, text="🎙 ГОЛОСОВОЙ ПОМОЩНИК",
             font=("Segoe UI", 16, "bold"),
@@ -408,12 +435,11 @@ class VoiceAssistantApp(tk.Tk):
         ).pack(pady=(18, 4))
 
         tk.Label(
-            self, text="Voice Assistant Lite  •  Vosk offline",
+            self, text="Voice Assistant Lite • Vosk offline • Silero TTS Neural Voice",
             font=("Segoe UI", 9),
             bg=BG, fg="#6c7086",
         ).pack()
 
-        # Кнопки
         btn_frame = tk.Frame(self, bg=BG)
         btn_frame.pack(pady=14)
 
@@ -438,7 +464,6 @@ class VoiceAssistantApp(tk.Tk):
         )
         self._btn_stop.grid(row=0, column=1, padx=6)
 
-        # Кнопка голоса (вкл/выкл)
         self._voice_enabled = True
         self._btn_voice = tk.Button(
             btn_frame, text="🔊 Голос: ВКЛ",
@@ -470,7 +495,6 @@ class VoiceAssistantApp(tk.Tk):
         )
         self._btn_help.grid(row=0, column=4, padx=6)
 
-        # Статус
         status_frame = tk.Frame(self, bg=BG)
         status_frame.pack(fill="x", padx=20)
 
@@ -481,7 +505,6 @@ class VoiceAssistantApp(tk.Tk):
                  font=("Segoe UI", 10, "bold"),
                  bg=BG, fg=FG).pack(side="left", padx=6)
 
-        # Последняя команда
         last_frame = tk.Frame(self, bg=BG)
         last_frame.pack(fill="x", padx=20, pady=(6, 0))
         tk.Label(last_frame, text="Распознано:", font=("Segoe UI", 10),
@@ -491,7 +514,6 @@ class VoiceAssistantApp(tk.Tk):
                  font=("Segoe UI", 10, "italic"),
                  bg=BG, fg=ACCENT).pack(side="left", padx=6)
 
-        # Журнал
         log_outer = tk.Frame(self, bg=BG)
         log_outer.pack(fill="both", expand=True, padx=20, pady=14)
 
@@ -517,22 +539,20 @@ class VoiceAssistantApp(tk.Tk):
         scrollbar.pack(side="right", fill="y")
         self._log_text.pack(side="left", fill="both", expand=True)
 
-        # Теги для цветов
         self._log_text.tag_config("ok",  foreground="#a6e3a1")
         self._log_text.tag_config("err", foreground="#f38ba8")
         self._log_text.tag_config("info", foreground="#89dceb")
 
-        # Нижняя строка
         tk.Label(
             self,
-            text="Модель: Vosk  •  Офлайн  •  Данные не передаются",
+            text="Модель: Vosk + Silero TTS (нейросетевой голос) • Офлайн",
             font=("Segoe UI", 8),
             bg=BG, fg="#45475a",
         ).pack(pady=(0, 10))
 
-        self.geometry("680x520")
+        self.geometry("680x540")
+        self._set_status("Готов. Нажмите 'Слушать'")
 
-    # ── Переключение голоса ─────────────────────────────────────────────
     def _toggle_voice(self):
         self._voice_enabled = not self._voice_enabled
         if self._voice_enabled:
@@ -541,7 +561,6 @@ class VoiceAssistantApp(tk.Tk):
         else:
             self._btn_voice.config(text="🔇 Голос: ВЫКЛ", bg="#6c7086")
 
-    # ── Показ списка команд ─────────────────────────────────────────────
     def _show_commands(self):
         help_win = tk.Toplevel(self)
         help_win.title("Список команд")
@@ -559,52 +578,44 @@ class VoiceAssistantApp(tk.Tk):
    • открой калькулятор
    • открой блокнот
    • закрой окно
-   • выключи компьютер / выключи пк
+   • выключи компьютер
 
 🌐 ИНТЕРНЕТ
    • открой почту
    • что нового
-   • включи ютуб / открой ютуб
+   • включи ютуб
    • включи саундклауд
 
-🎮 ИГРЫ И ПРОГРАММЫ
-   • включи кс / включи контр страйк
-   • включи дискорд / открой дискорд
+🎮 ИГРЫ
+   • включи кс
+   • включи дискорд
 
-🔊 УПРАВЛЕНИЕ ПК
-   • увеличь громкость / громче
-   • уменьши громкость / тише
+🔊 УПРАВЛЕНИЕ
+   • увеличь громкость
+   • уменьши громкость
    • заблокировать экран
 
 📅 ДАТА И ВРЕМЯ
-   • какое сегодня число / какая дата
-   • сколько времени / который час
+   • какое сегодня число
+   • сколько времени
 
 💬 РАЗГОВОР
    • привет
    • как дела
    • спасибо
    • пока
-
-⚡ РАСШИРЕННЫЕ
-   • выполни команду [команда]
-   • ➕ Добавить команду — своя команда
 """
-
         text_widget = tk.Text(
             help_win,
             font=("Consolas", 10),
             bg="#181825", fg="#cdd6f4",
             relief="flat",
-            width=42, height=32,
+            width=42, height=26,
             padx=12, pady=8,
         )
         text_widget.pack(padx=12, pady=(0, 12))
         text_widget.insert("1.0", commands_text)
         text_widget.config(state="disabled")
-
-        # Теги для цветов
-        text_widget.tag_config("header", foreground="#89b4fa", font=("Segoe UI", 10, "bold"))
 
         tk.Button(
             help_win, text="Закрыть",
@@ -614,7 +625,6 @@ class VoiceAssistantApp(tk.Tk):
             command=help_win.destroy
         ).pack(pady=(0, 12))
 
-    # ── Управление прослушиванием ───────────────────────────────────────
     def _start_listening(self):
         self._btn_start.config(state="disabled")
         self._btn_stop.config(state="normal")
@@ -625,16 +635,13 @@ class VoiceAssistantApp(tk.Tk):
         self._btn_stop.config(state="disabled")
         self._recognizer.stop()
 
-    # ── Обработка распознанного текста ─────────────────────────────────
     def _on_speech_result(self, text: str):
-        """Вызывается из потока распознавания — переключаемся в GUI-поток."""
         self.after(0, self._process_text, text)
 
     def _process_text(self, text: str):
         self._last_var.set(f'"{text}"')
         ts = datetime.datetime.now().strftime("%H:%M:%S")
 
-        # Режим ожидания голосового подтверждения
         if self._waiting_confirm:
             self._handle_confirmation(text, ts)
             return
@@ -642,13 +649,13 @@ class VoiceAssistantApp(tk.Tk):
         success, message = self._cmd_manager.execute(text)
 
         if success is None:
-            # Нужно голосовое подтверждение
-            self._pending_dangerous = message  # message = фраза команды
+            self._pending_dangerous = message
             self._waiting_confirm = True
             confirm_msg = "Вы уверены? Скажите «да» или «нет»"
             self._set_status(f"⚠ {confirm_msg}")
             self._log_entry(ts, text, f"⚠ {confirm_msg}", "info")
-            speaker.say(confirm_msg)
+            if self._voice_enabled:
+                speaker.say(confirm_msg)
         else:
             self._on_command_done(ts, text, success, message)
 
@@ -676,7 +683,7 @@ class VoiceAssistantApp(tk.Tk):
             icon = "✅"
             tag = "ok"
             if self._voice_enabled:
-                speaker.say(message)  # произносит ответ
+                speaker.say(message)
         else:
             icon = "❌"
             tag = "err"
@@ -686,7 +693,6 @@ class VoiceAssistantApp(tk.Tk):
         self._log_entry(ts, text, f"{icon} {message}", tag)
         self._set_status("🎤 Слушаю..." if self._recognizer._running else "⏹ Остановлено")
 
-    # ── Журнал ──────────────────────────────────────────────────────────
     def _log_entry(self, ts: str, command: str, result: str, tag: str = "ok"):
         self._log_text.config(state="normal")
         line = f"{ts}  →  \"{command}\"\n         {result}\n"
@@ -694,11 +700,9 @@ class VoiceAssistantApp(tk.Tk):
         self._log_text.see("end")
         self._log_text.config(state="disabled")
 
-    # ── Статус ──────────────────────────────────────────────────────────
     def _set_status(self, text: str):
         self.after(0, self._status_var.set, text)
 
-    # ── Диалог добавления команды ───────────────────────────────────────
     def _add_command_dialog(self):
         dialog = AddCommandDialog(self)
         self.wait_window(dialog)
@@ -714,9 +718,6 @@ class VoiceAssistantApp(tk.Tk):
             )
 
 
-# ─────────────────────────────────────────────
-#  Диалог добавления команды
-# ─────────────────────────────────────────────
 class AddCommandDialog(tk.Toplevel):
     def __init__(self, parent):
         super().__init__(parent)
@@ -735,7 +736,6 @@ class AddCommandDialog(tk.Toplevel):
                  font=("Segoe UI", 13, "bold"),
                  bg=BG, fg=ACCENT).pack(pady=(16, 4), padx=20)
 
-        # Фраза
         tk.Label(self, text="Фраза (что говорить):",
                  font=("Segoe UI", 10), bg=BG, fg=FG).pack(anchor="w", padx=20)
         self._phrase_var = tk.StringVar()
@@ -744,7 +744,6 @@ class AddCommandDialog(tk.Toplevel):
                  bg="#313244", fg=FG, insertbackground=FG,
                  relief="flat", width=36).pack(padx=20, pady=(2, 10), ipady=4)
 
-        # Действие
         tk.Label(self, text="Действие:",
                  font=("Segoe UI", 10), bg=BG, fg=FG).pack(anchor="w", padx=20)
         self._action_var = tk.StringVar()
@@ -760,7 +759,6 @@ class AddCommandDialog(tk.Toplevel):
             justify="left",
         ).pack(anchor="w", padx=20, pady=(0, 10))
 
-        # Кнопки
         btn_f = tk.Frame(self, bg=BG)
         btn_f.pack(pady=(0, 16))
         tk.Button(btn_f, text="Сохранить",
@@ -786,9 +784,6 @@ class AddCommandDialog(tk.Toplevel):
         self.destroy()
 
 
-# ─────────────────────────────────────────────
-#  Точка входа
-# ─────────────────────────────────────────────
 def main():
     app = VoiceAssistantApp()
     app.mainloop()
